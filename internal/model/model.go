@@ -1,0 +1,259 @@
+// Package model holds the in-memory schema representation shared by the
+// CUE-exported desired state and the INFORMATION_SCHEMA-introspected
+// actual state.
+package model
+
+import (
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+)
+
+type Database struct {
+	Project  string
+	Instance string
+	Name     string
+	Tables   []*Table // declaration order
+}
+
+type Table struct {
+	Name        string
+	Columns     []*Column // declaration order
+	PrimaryKey  []KeyPart
+	Interleave  *Interleave
+	Indexes     []*Index
+	ForeignKeys []*ForeignKey
+	Checks      []*Check
+	// DependsOn lists tables that must be created before this one and
+	// dropped after it. It orders DDL only and never appears in it.
+	DependsOn []string
+}
+
+type Column struct {
+	Name    string
+	Type    string
+	NotNull bool
+	Default string // GoogleSQL expression; empty means no default
+}
+
+type KeyPart struct {
+	Column string
+	Desc   bool
+}
+
+type Interleave struct {
+	Parent   string
+	OnDelete string // "NO ACTION" | "CASCADE"
+}
+
+type Index struct {
+	Name         string
+	Columns      []KeyPart
+	Unique       bool
+	NullFiltered bool
+	Storing      []string
+}
+
+type ForeignKey struct {
+	Name       string
+	Columns    []string
+	RefTable   string
+	RefColumns []string
+	OnDelete   string // "NO ACTION" | "CASCADE"
+}
+
+type Check struct {
+	Name       string
+	Expression string
+}
+
+func (d *Database) Table(name string) *Table {
+	for _, t := range d.Tables {
+		if t.Name == name {
+			return t
+		}
+	}
+	return nil
+}
+
+func (t *Table) Column(name string) *Column {
+	for _, c := range t.Columns {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+func (t *Table) Index(name string) *Index {
+	for _, i := range t.Indexes {
+		if i.Name == name {
+			return i
+		}
+	}
+	return nil
+}
+
+func (t *Table) ForeignKey(name string) *ForeignKey {
+	for _, fk := range t.ForeignKeys {
+		if fk.Name == name {
+			return fk
+		}
+	}
+	return nil
+}
+
+func (t *Table) Check(name string) *Check {
+	for _, c := range t.Checks {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+var typeSpaces = regexp.MustCompile(`\s+`)
+
+// NormalizeType canonicalizes a Spanner type string for comparison:
+// uppercase keywords and no internal whitespace, e.g. "array< string(36) >"
+// becomes "ARRAY<STRING(36)>". Spanner types contain no string literals,
+// so uppercasing the whole spelling is safe.
+func NormalizeType(t string) string {
+	return strings.ToUpper(typeSpaces.ReplaceAllString(strings.TrimSpace(t), ""))
+}
+
+// NormalizeExpr lightly canonicalizes a GoogleSQL expression for comparison.
+// INFORMATION_SCHEMA stores expressions close to their original spelling, so
+// only whitespace runs and one layer of redundant outer parentheses are
+// normalized. Cosmetic rewrites beyond that may still produce spurious diffs.
+func NormalizeExpr(e string) string {
+	s := strings.TrimSpace(typeSpaces.ReplaceAllString(e, " "))
+	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && balancedTrim(s) {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
+}
+
+// balancedTrim reports whether the outer parentheses of s wrap the whole
+// expression (so "(a) AND (b)" is not stripped to "a) AND (b").
+func balancedTrim(s string) bool {
+	depth := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+// Validate checks cross-references that the CUE schema cannot express:
+// key parts, interleave parents, and foreign-key targets must resolve.
+func (d *Database) Validate() error {
+	for _, t := range d.Tables {
+		for _, kp := range t.PrimaryKey {
+			if t.Column(kp.Column) == nil {
+				return fmt.Errorf("table %s: primary key column %q not declared", t.Name, kp.Column)
+			}
+		}
+		if t.Interleave != nil {
+			parent := d.Table(t.Interleave.Parent)
+			if parent == nil {
+				return fmt.Errorf("table %s: interleave parent %q not declared", t.Name, t.Interleave.Parent)
+			}
+			// Spanner requires the child PK to start with the parent PK.
+			if len(t.PrimaryKey) <= len(parent.PrimaryKey) {
+				return fmt.Errorf("table %s: interleaved child primary key must extend parent %s primary key", t.Name, parent.Name)
+			}
+			for i, kp := range parent.PrimaryKey {
+				if t.PrimaryKey[i] != kp {
+					return fmt.Errorf("table %s: primary key must be prefixed by parent %s primary key", t.Name, parent.Name)
+				}
+			}
+		}
+		for _, idx := range t.Indexes {
+			for _, kp := range idx.Columns {
+				if t.Column(kp.Column) == nil {
+					return fmt.Errorf("index %s on %s: column %q not declared", idx.Name, t.Name, kp.Column)
+				}
+			}
+			for _, c := range idx.Storing {
+				if t.Column(c) == nil {
+					return fmt.Errorf("index %s on %s: storing column %q not declared", idx.Name, t.Name, c)
+				}
+			}
+		}
+		for _, dep := range t.DependsOn {
+			if d.Table(dep) == nil {
+				return fmt.Errorf("table %s: dependsOn target %q not declared", t.Name, dep)
+			}
+		}
+		for _, fk := range t.ForeignKeys {
+			for _, c := range fk.Columns {
+				if t.Column(c) == nil {
+					return fmt.Errorf("foreign key %s on %s: column %q not declared", fk.Name, t.Name, c)
+				}
+			}
+			ref := d.Table(fk.RefTable)
+			if ref == nil {
+				return fmt.Errorf("foreign key %s on %s: referenced table %q not declared", fk.Name, t.Name, fk.RefTable)
+			}
+			for _, c := range fk.RefColumns {
+				if ref.Column(c) == nil {
+					return fmt.Errorf("foreign key %s on %s: referenced column %s.%q not declared", fk.Name, t.Name, fk.RefTable, c)
+				}
+			}
+			if len(fk.Columns) != len(fk.RefColumns) {
+				return fmt.Errorf("foreign key %s on %s: column count mismatch", fk.Name, t.Name)
+			}
+		}
+	}
+	return d.checkOrderingCycles()
+}
+
+// checkOrderingCycles rejects cycles in the creation-order graph formed by
+// interleave parents and dependsOn edges; topological sorting would
+// otherwise break the cycle at an arbitrary point silently.
+func (d *Database) checkOrderingCycles() error {
+	const (
+		unvisited = iota
+		visiting
+		done
+	)
+	state := map[string]int{}
+	var visit func(t *Table) error
+	visit = func(t *Table) error {
+		switch state[t.Name] {
+		case visiting:
+			return fmt.Errorf("table %s: dependency cycle through interleave/dependsOn", t.Name)
+		case done:
+			return nil
+		}
+		state[t.Name] = visiting
+		deps := slices.Clone(t.DependsOn)
+		if t.Interleave != nil {
+			deps = append(deps, t.Interleave.Parent)
+		}
+		for _, dep := range deps {
+			if next := d.Table(dep); next != nil {
+				if err := visit(next); err != nil {
+					return err
+				}
+			}
+		}
+		state[t.Name] = done
+		return nil
+	}
+	for _, t := range d.Tables {
+		if err := visit(t); err != nil {
+			return err
+		}
+	}
+	return nil
+}

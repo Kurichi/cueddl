@@ -86,6 +86,62 @@ database: schema.#Database & {
 UpdatedAt: {type: "TIMESTAMP", allowCommitTimestamp: true}
 ```
 
+## 環境ごとの構成 (dev / prod)
+
+テーブル定義を共有パッケージに切り出し、環境ごとのパッケージから import して
+接続先だけ差し替えられます ([examples/multienv](examples/multienv) 参照):
+
+```
+myschema/
+├── tables/tables.cue   # 共有テーブル・ビュー定義
+├── dev/database.cue    # dev 接続先 + dev 専用テーブルの追加
+└── prod/database.cue   # prod 接続先
+```
+
+```cue
+// tables/tables.cue
+package tables
+
+import "github.com/kurichi/cueddl/schema"
+
+Tables: [Name=string]: schema.#Table & {name: Name}
+Tables: {
+	Users: {...}
+	Orders: {...}
+}
+```
+
+```cue
+// dev/database.cue
+package db
+
+import (
+	"github.com/kurichi/cueddl/schema"
+	// フィールド名 tables: と衝突するためエイリアスを付ける
+	shared "example.com/myschema/tables"
+)
+
+database: schema.#Database & {
+	project:  "my-project-dev"
+	instance: "dev-instance"
+	name:     "myapp-dev"
+
+	tables: shared.Tables
+	tables: DebugEvents: {...} // 環境固有のテーブルは unification で追加
+}
+```
+
+適用は環境ディレクトリを指定するだけです:
+
+```sh
+go tool cue cmd apply ./dev
+go tool cue cmd apply ./prod
+```
+
+CUE の unification なので、環境固有のテーブル追加だけでなく
+「dev だけインデックスを足す」「prod だけ TTL 的な列を足す」といった
+部分的な上書き・拡張も同じ仕組みで表現できます。
+
 型・必須フィールド・相互参照 (interleave の親、FK の参照先、キー列の存在) は
 CUE の unification と `cueddl` の検証で二段構えでチェックされます。
 

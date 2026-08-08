@@ -25,6 +25,11 @@ type Plan struct {
 	// Warnings lists desired changes that cannot be expressed as Spanner
 	// DDL (e.g. primary-key changes) and were therefore skipped.
 	Warnings []string
+
+	// deferredColumnDrops are emitted at the very end of the plan: a view
+	// still holding its old definition may reference these columns, so
+	// they can only go after views are replaced.
+	deferredColumnDrops []string
 }
 
 func (p *Plan) add(sql string) { p.Statements = append(p.Statements, Statement{SQL: sql}) }
@@ -40,8 +45,21 @@ func (p *Plan) HasDestructive() bool {
 }
 
 // Diff returns the ordered migration plan from actual to desired.
+// It may rewrite names inside actual while resolving renames.
 func Diff(desired, actual *model.Database) *Plan {
 	p := &Plan{}
+
+	// Phase 0: drop removed views. They must go before table renames and
+	// drops, since a view blocks DDL on anything it references.
+	for _, av := range actual.Views {
+		if desired.View(av.Name) == nil {
+			p.add(ddlgen.DropView(av.Name))
+		}
+	}
+
+	// Phase 0.5: renames. The actual model is rewritten to the new names
+	// so the rest of the diff sees the renamed table as the same table.
+	applyRenames(p, desired, actual)
 
 	dropped := map[string]bool{}
 	for _, t := range actual.Tables {
@@ -122,7 +140,52 @@ func Diff(desired, actual *model.Database) *Plan {
 		}
 	}
 
+	// Phase 7: create new views and replace changed ones.
+	for _, dv := range topoViews(desired.Views) {
+		av := actual.View(dv.Name)
+		switch {
+		case av == nil:
+			p.add(ddlgen.CreateView(dv, false))
+		case !viewEqual(dv, av):
+			p.add(ddlgen.CreateView(dv, true))
+		}
+	}
+
+	// Phase 8: column drops, deferred until stale view definitions are gone.
+	for _, sql := range p.deferredColumnDrops {
+		p.addDestructive(sql)
+	}
+
 	return p
+}
+
+// applyRenames emits ALTER TABLE ... RENAME TO for tables whose desired
+// state names an existing table via renamedFrom, then rewrites the actual
+// model (table name, interleave parents, FK targets) to the new name.
+func applyRenames(p *Plan, desired, actual *model.Database) {
+	for _, dt := range desired.Tables {
+		if dt.RenamedFrom == "" {
+			continue
+		}
+		old := actual.Table(dt.RenamedFrom)
+		if old == nil || actual.Table(dt.Name) != nil {
+			// Already renamed (or the hint is stale): nothing to do.
+			continue
+		}
+		p.add(ddlgen.RenameTable(old.Name, dt.Name))
+		oldName := old.Name
+		old.Name = dt.Name
+		for _, t := range actual.Tables {
+			if t.Interleave != nil && t.Interleave.Parent == oldName {
+				t.Interleave.Parent = dt.Name
+			}
+			for _, fk := range t.ForeignKeys {
+				if fk.RefTable == oldName {
+					fk.RefTable = dt.Name
+				}
+			}
+		}
+	}
 }
 
 func diffTable(p *Plan, dt, at *model.Table) {
@@ -136,7 +199,7 @@ func diffTable(p *Plan, dt, at *model.Table) {
 
 	for _, ac := range at.Columns {
 		if dt.Column(ac.Name) == nil {
-			p.addDestructive(ddlgen.DropColumn(dt.Name, ac.Name))
+			p.deferredColumnDrops = append(p.deferredColumnDrops, ddlgen.DropColumn(dt.Name, ac.Name))
 		}
 	}
 	for _, dc := range dt.Columns {
@@ -154,6 +217,9 @@ func diffTable(p *Plan, dt, at *model.Table) {
 		}
 		if model.NormalizeExpr(dc.Default) != model.NormalizeExpr(ac.Default) {
 			p.add(ddlgen.SetColumnDefault(dt.Name, dc))
+		}
+		if dc.AllowCommitTimestamp != ac.AllowCommitTimestamp {
+			p.add(ddlgen.SetColumnOptions(dt.Name, dc))
 		}
 	}
 }
@@ -181,6 +247,40 @@ func fkEqual(a, b *model.ForeignKey) bool {
 
 func checkEqual(a, b *model.Check) bool {
 	return model.NormalizeExpr(a.Expression) == model.NormalizeExpr(b.Expression)
+}
+
+func viewEqual(a, b *model.View) bool {
+	return a.SecurityType == b.SecurityType &&
+		model.NormalizeExpr(a.Definition) == model.NormalizeExpr(b.Definition)
+}
+
+// topoViews orders views so dependsOn targets precede their dependents;
+// tables all exist by the time views are created, so only view-to-view
+// edges matter here.
+func topoViews(views []*model.View) []*model.View {
+	var out []*model.View
+	visited := map[string]bool{}
+	byName := map[string]*model.View{}
+	for _, v := range views {
+		byName[v.Name] = v
+	}
+	var visit func(v *model.View)
+	visit = func(v *model.View) {
+		if visited[v.Name] {
+			return
+		}
+		visited[v.Name] = true
+		for _, dep := range v.DependsOn {
+			if target := byName[dep]; target != nil {
+				visit(target)
+			}
+		}
+		out = append(out, v)
+	}
+	for _, v := range views {
+		visit(v)
+	}
+	return out
 }
 
 // sameSet compares STORING column lists order-insensitively, since

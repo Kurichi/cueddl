@@ -19,6 +19,7 @@ database: schema.#Database & {
 				Name:      {type: "STRING(MAX)"} // added
 				Age:       {type: "INT64", notNull: true, default: "0"} // NOT NULL + default added
 				CreatedAt: {type: "TIMESTAMP", notNull: true, default: "CURRENT_TIMESTAMP()"}
+				UpdatedAt: {type: "TIMESTAMP", allowCommitTimestamp: true} // option added -> SET OPTIONS
 			}
 			primaryKey: ["UserID"]
 			indexes: {
@@ -33,7 +34,9 @@ database: schema.#Database & {
 			}
 		}
 
-		Orders: {
+		// Orders was renamed: ALTER TABLE ... RENAME TO, not drop + create.
+		Purchases: {
+			renamedFrom: "Orders"
 			columns: {
 				UserID:  {type: "STRING(36)", notNull: true}
 				OrderID: {type: "STRING(36)", notNull: true}
@@ -55,5 +58,13 @@ database: schema.#Database & {
 		}
 
 		// AuditLogs is gone: its FK and table are dropped (destructive).
+	}
+
+	views: {
+		// Definition changed -> CREATE OR REPLACE VIEW.
+		UserEmails: {
+			definition: "SELECT u.UserID, u.Email, u.Name FROM Users AS u"
+			dependsOn: ["Users"]
+		}
 	}
 }

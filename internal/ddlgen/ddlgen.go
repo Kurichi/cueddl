@@ -35,6 +35,9 @@ func ColumnDef(c *model.Column) string {
 	if c.Default != "" {
 		fmt.Fprintf(&b, " DEFAULT (%s)", c.Default)
 	}
+	if c.AllowCommitTimestamp {
+		b.WriteString(" OPTIONS (allow_commit_timestamp=true)")
+	}
 	return b.String()
 }
 
@@ -135,4 +138,31 @@ func DropConstraint(table, name string) string {
 
 func DropTable(name string) string {
 	return "DROP TABLE " + Q(name)
+}
+
+func RenameTable(from, to string) string {
+	return fmt.Sprintf("ALTER TABLE %s RENAME TO %s", Q(from), Q(to))
+}
+
+// SetColumnOptions toggles allow_commit_timestamp; Spanner clears an
+// option by setting it to null.
+func SetColumnOptions(table string, c *model.Column) string {
+	value := "null"
+	if c.AllowCommitTimestamp {
+		value = "true"
+	}
+	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET OPTIONS (allow_commit_timestamp=%s)",
+		Q(table), Q(c.Name), value)
+}
+
+func CreateView(v *model.View, orReplace bool) string {
+	create := "CREATE VIEW"
+	if orReplace {
+		create = "CREATE OR REPLACE VIEW"
+	}
+	return fmt.Sprintf("%s %s SQL SECURITY %s AS %s", create, Q(v.Name), v.SecurityType, v.Definition)
+}
+
+func DropView(name string) string {
+	return "DROP VIEW " + Q(name)
 }

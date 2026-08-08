@@ -76,6 +76,27 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 		return nil, fmt.Errorf("introspect columns: %w", err)
 	}
 
+	// allow_commit_timestamp lives in column_options, not columns.
+	err = query(ctx, client, `
+		SELECT co.table_name, co.column_name, co.option_value
+		FROM information_schema.column_options AS co
+		WHERE co.table_schema = '' AND co.option_name = 'allow_commit_timestamp'`,
+		func(row *spanner.Row) error {
+			var table, column, value string
+			if err := row.Columns(&table, &column, &value); err != nil {
+				return err
+			}
+			if t := tables[table]; t != nil && strings.EqualFold(value, "TRUE") {
+				if c := t.Column(column); c != nil {
+					c.AllowCommitTimestamp = true
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("introspect column options: %w", err)
+	}
+
 	// Primary keys and secondary index key parts come from index_columns.
 	// Rows with a NULL ordinal_position are STORING columns.
 	indexes := map[string]*model.Index{} // "table\x00index" -> index
@@ -239,6 +260,45 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 		})
 	if err != nil {
 		return nil, fmt.Errorf("introspect check constraints: %w", err)
+	}
+
+	// Views. SPANNER_VIEW_SECURITY_TYPE may be absent on older emulators,
+	// so fall back to a security-less query and assume INVOKER.
+	err = query(ctx, client, `
+		SELECT v.table_name, v.view_definition, v.security_type
+		FROM information_schema.views AS v
+		WHERE v.table_schema = ''
+		ORDER BY v.table_name`,
+		func(row *spanner.Row) error {
+			var name, def string
+			var security spanner.NullString
+			if err := row.Columns(&name, &def, &security); err != nil {
+				return err
+			}
+			v := &model.View{Name: name, Definition: def, SecurityType: "INVOKER"}
+			if security.Valid && security.StringVal != "" {
+				v.SecurityType = security.StringVal
+			}
+			db.Views = append(db.Views, v)
+			return nil
+		})
+	if err != nil {
+		err = query(ctx, client, `
+			SELECT v.table_name, v.view_definition
+			FROM information_schema.views AS v
+			WHERE v.table_schema = ''
+			ORDER BY v.table_name`,
+			func(row *spanner.Row) error {
+				var name, def string
+				if err := row.Columns(&name, &def); err != nil {
+					return err
+				}
+				db.Views = append(db.Views, &model.View{Name: name, Definition: def, SecurityType: "INVOKER"})
+				return nil
+			})
+		if err != nil {
+			return nil, fmt.Errorf("introspect views: %w", err)
+		}
 	}
 
 	return db, nil

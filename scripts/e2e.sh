@@ -32,8 +32,8 @@ fail() {
 	exit 1
 }
 
-go tool cue cmd apply ./examples/simple | grep -q "Applied 6 statement" ||
-	fail "initial apply did not run 6 statements"
+go tool cue cmd apply ./examples/simple | grep -q "Applied 7 statement" ||
+	fail "initial apply did not run 7 statements"
 go tool cue cmd plan ./examples/simple | grep -q "No changes" ||
 	fail "simple is not idempotent"
 go tool cue cmd plan ./examples/evolved | grep -q "1 destructive" ||
@@ -41,8 +41,10 @@ go tool cue cmd plan ./examples/evolved | grep -q "1 destructive" ||
 if go tool cue cmd apply ./examples/evolved >/dev/null 2>&1; then
 	fail "destructive apply was not refused"
 fi
-CUEDDL_ALLOW_DESTRUCTIVE=1 go tool cue cmd apply ./examples/evolved | grep -q "Applied 9 statement" ||
-	fail "evolved apply did not run 9 statements"
+go tool cue cmd plan ./examples/evolved | grep -q 'RENAME TO `Purchases`' ||
+	fail "evolved plan did not use RENAME for Orders -> Purchases"
+CUEDDL_ALLOW_DESTRUCTIVE=1 go tool cue cmd apply ./examples/evolved | grep -q "Applied 12 statement" ||
+	fail "evolved apply did not run 12 statements"
 go tool cue cmd plan ./examples/evolved | grep -q "No changes" ||
 	fail "evolved is not idempotent"
 

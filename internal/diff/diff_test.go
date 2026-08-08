@@ -181,6 +181,99 @@ func TestDependsOnOrdersCreatesAndDrops(t *testing.T) {
 	}
 }
 
+func TestRenameTable(t *testing.T) {
+	actual := &model.Database{Tables: []*model.Table{users(), orders()}}
+	desired := &model.Database{Tables: []*model.Table{users(), orders()}}
+	desired.Tables[1].Name = "Purchases"
+	desired.Tables[1].RenamedFrom = "Orders"
+
+	p := Diff(desired, actual)
+	stmts := sqls(p)
+	indexOf(t, stmts, "ALTER TABLE `Orders` RENAME TO `Purchases`")
+	if len(stmts) != 1 {
+		t.Errorf("rename must not produce drop/create, got %v", stmts)
+	}
+	if p.HasDestructive() {
+		t.Error("a pure rename must not be destructive")
+	}
+
+	// A stale hint (old table already gone, new name present) is a no-op.
+	p = Diff(desired, &model.Database{Tables: []*model.Table{users(), desired.Tables[1]}})
+	if len(p.Statements) != 0 {
+		t.Errorf("stale rename hint must be ignored, got %v", sqls(p))
+	}
+}
+
+func TestRenameRewritesInterleaveParent(t *testing.T) {
+	actual := &model.Database{Tables: []*model.Table{users(), orders()}}
+	desired := &model.Database{Tables: []*model.Table{users(), orders()}}
+	desired.Tables[0].Name = "Members"
+	desired.Tables[0].RenamedFrom = "Users"
+	desired.Tables[0].Indexes = nil
+	actual.Tables[0].Indexes = nil
+	desired.Tables[1].Interleave.Parent = "Members"
+
+	p := Diff(desired, actual)
+	stmts := sqls(p)
+	indexOf(t, stmts, "ALTER TABLE `Users` RENAME TO `Members`")
+	if len(stmts) != 1 {
+		t.Errorf("interleave parent rename must not touch the child, got %v", stmts)
+	}
+}
+
+func TestAllowCommitTimestampToggle(t *testing.T) {
+	withTS := func(on bool) *model.Database {
+		u := users()
+		u.Columns = append(u.Columns, &model.Column{Name: "UpdatedAt", Type: "TIMESTAMP", AllowCommitTimestamp: on})
+		return &model.Database{Tables: []*model.Table{u}}
+	}
+	p := Diff(withTS(true), withTS(false))
+	indexOf(t, sqls(p), "ALTER TABLE `Users` ALTER COLUMN `UpdatedAt` SET OPTIONS (allow_commit_timestamp=true)")
+	p = Diff(withTS(false), withTS(true))
+	indexOf(t, sqls(p), "SET OPTIONS (allow_commit_timestamp=null)")
+}
+
+func TestViewLifecycle(t *testing.T) {
+	base := &model.Database{Tables: []*model.Table{users()}}
+	v := &model.View{Name: "UserEmails", Definition: "SELECT Email FROM Users", SecurityType: "INVOKER"}
+
+	// Create: after tables.
+	desired := &model.Database{Tables: []*model.Table{users()}, Views: []*model.View{v}}
+	p := Diff(desired, &model.Database{})
+	stmts := sqls(p)
+	if indexOf(t, stmts, "CREATE VIEW `UserEmails` SQL SECURITY INVOKER AS SELECT Email FROM Users") <
+		indexOf(t, stmts, "CREATE TABLE `Users`") {
+		t.Error("views must be created after tables")
+	}
+
+	// Change: OR REPLACE.
+	changed := &model.View{Name: "UserEmails", Definition: "SELECT UserID, Email FROM Users", SecurityType: "INVOKER"}
+	p = Diff(&model.Database{Tables: []*model.Table{users()}, Views: []*model.View{changed}}, desired)
+	indexOf(t, sqls(p), "CREATE OR REPLACE VIEW `UserEmails`")
+
+	// Remove: DROP VIEW comes before everything else.
+	p = Diff(base, desired)
+	if sqls(p)[0] != "DROP VIEW `UserEmails`" {
+		t.Errorf("removed view must be dropped first, got %v", sqls(p))
+	}
+}
+
+func TestColumnDropDeferredAfterViewReplace(t *testing.T) {
+	// Email is dropped while the view that referenced it gets a new
+	// definition: the DROP COLUMN must come after the view replacement.
+	actualView := &model.View{Name: "V", Definition: "SELECT Email FROM Users", SecurityType: "INVOKER"}
+	desiredView := &model.View{Name: "V", Definition: "SELECT UserID FROM Users", SecurityType: "INVOKER"}
+	actual := &model.Database{Tables: []*model.Table{users()}, Views: []*model.View{actualView}}
+	desired := &model.Database{Tables: []*model.Table{users()}, Views: []*model.View{desiredView}}
+	desired.Tables[0].Columns = desired.Tables[0].Columns[:1] // drop Email
+	desired.Tables[0].Indexes = nil
+	p := Diff(desired, actual)
+	stmts := sqls(p)
+	if indexOf(t, stmts, "DROP COLUMN `Email`") < indexOf(t, stmts, "CREATE OR REPLACE VIEW `V`") {
+		t.Errorf("column drop must come after view replacement:\n%s", strings.Join(stmts, "\n"))
+	}
+}
+
 func TestDefaultChange(t *testing.T) {
 	desired := &model.Database{Tables: []*model.Table{users()}}
 	desired.Tables[0].Columns[1].Default = `"unknown"`

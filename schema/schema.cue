@@ -23,6 +23,14 @@ package schema
 	notNull: *false | bool
 	// default is a GoogleSQL expression, e.g. "CURRENT_TIMESTAMP()" or "0".
 	default?: string
+	// allowCommitTimestamp renders OPTIONS (allow_commit_timestamp=true).
+	// Only valid on TIMESTAMP columns.
+	allowCommitTimestamp?: bool
+	if allowCommitTimestamp != _|_ {
+		if allowCommitTimestamp {
+			type: "TIMESTAMP"
+		}
+	}
 }
 
 // #KeyPart is one component of a primary key or index key.
@@ -79,6 +87,21 @@ package schema
 	// (and dropped after it). Interleave parents are ordered automatically;
 	// use this for dependencies cueddl cannot infer.
 	dependsOn?: [...string]
+	// renamedFrom marks this table as a rename of an existing table so the
+	// diff emits ALTER TABLE ... RENAME TO instead of DROP + CREATE (which
+	// would lose data). Remove the hint once every environment is migrated.
+	renamedFrom?: string
+}
+
+// #View is a SQL view over tables or other views.
+#View: {
+	// name is filled in from the struct key in #Database.views.
+	name!: string
+	// definition is the SELECT statement (everything after AS).
+	definition!: string
+	securityType: *"INVOKER" | "DEFINER"
+	// dependsOn orders creation among views; tables always exist first.
+	dependsOn?: [...string]
 }
 
 // #Database is the root of a cueddl configuration: the connection target
@@ -89,4 +112,5 @@ package schema
 	instance!: string
 	name!:     string
 	tables: [Name=string]: #Table & {name: Name}
+	views: [Name=string]: #View & {name: Name}
 }

@@ -14,6 +14,7 @@ database: schema.#Database & {
 				Email:     {type: "STRING(MAX)", notNull: true}
 				Age:       {type: "INT64"}
 				CreatedAt: {type: "TIMESTAMP", notNull: true, default: "CURRENT_TIMESTAMP()"}
+				UpdatedAt: {type: "TIMESTAMP"}
 			}
 			primaryKey: ["UserID"]
 			indexes: {
@@ -65,6 +66,13 @@ database: schema.#Database & {
 					}
 				}
 			}
+		}
+	}
+
+	views: {
+		UserEmails: {
+			definition: "SELECT u.UserID, u.Email FROM Users AS u"
+			dependsOn: ["Users"]
 		}
 	}
 }

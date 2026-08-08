@@ -15,6 +15,7 @@ type Database struct {
 	Instance string
 	Name     string
 	Tables   []*Table // declaration order
+	Views    []*View
 }
 
 type Table struct {
@@ -28,6 +29,10 @@ type Table struct {
 	// DependsOn lists tables that must be created before this one and
 	// dropped after it. It orders DDL only and never appears in it.
 	DependsOn []string
+	// RenamedFrom names the table this one was renamed from. The diff
+	// emits a rename instead of drop + create when the old name still
+	// exists in the live schema.
+	RenamedFrom string
 }
 
 type Column struct {
@@ -35,6 +40,15 @@ type Column struct {
 	Type    string
 	NotNull bool
 	Default string // GoogleSQL expression; empty means no default
+	// AllowCommitTimestamp maps to OPTIONS (allow_commit_timestamp=true).
+	AllowCommitTimestamp bool
+}
+
+type View struct {
+	Name         string
+	Definition   string // the SELECT statement after AS
+	SecurityType string // "INVOKER" | "DEFINER"
+	DependsOn    []string
 }
 
 type KeyPart struct {
@@ -72,6 +86,15 @@ func (d *Database) Table(name string) *Table {
 	for _, t := range d.Tables {
 		if t.Name == name {
 			return t
+		}
+	}
+	return nil
+}
+
+func (d *Database) View(name string) *View {
+	for _, v := range d.Views {
+		if v.Name == name {
+			return v
 		}
 	}
 	return nil
@@ -194,6 +217,12 @@ func (d *Database) Validate() error {
 				return fmt.Errorf("table %s: dependsOn target %q not declared", t.Name, dep)
 			}
 		}
+		for _, c := range t.Columns {
+			if c.AllowCommitTimestamp && c.Type != "TIMESTAMP" {
+				return fmt.Errorf("table %s: column %q: allowCommitTimestamp requires type TIMESTAMP, got %s",
+					t.Name, c.Name, c.Type)
+			}
+		}
 		for _, fk := range t.ForeignKeys {
 			for _, c := range fk.Columns {
 				if t.Column(c) == nil {
@@ -211,6 +240,13 @@ func (d *Database) Validate() error {
 			}
 			if len(fk.Columns) != len(fk.RefColumns) {
 				return fmt.Errorf("foreign key %s on %s: column count mismatch", fk.Name, t.Name)
+			}
+		}
+	}
+	for _, v := range d.Views {
+		for _, dep := range v.DependsOn {
+			if d.Table(dep) == nil && d.View(dep) == nil {
+				return fmt.Errorf("view %s: dependsOn target %q not declared", v.Name, dep)
 			}
 		}
 	}
@@ -252,6 +288,34 @@ func (d *Database) checkOrderingCycles() error {
 	}
 	for _, t := range d.Tables {
 		if err := visit(t); err != nil {
+			return err
+		}
+	}
+
+	// Views form their own graph: they may depend on other views, while
+	// tables never depend on views, so a separate walk suffices.
+	vstate := map[string]int{}
+	var visitView func(v *View) error
+	visitView = func(v *View) error {
+		switch vstate[v.Name] {
+		case visiting:
+			return fmt.Errorf("view %s: dependency cycle through dependsOn", v.Name)
+		case done:
+			return nil
+		}
+		vstate[v.Name] = visiting
+		for _, dep := range v.DependsOn {
+			if next := d.View(dep); next != nil {
+				if err := visitView(next); err != nil {
+					return err
+				}
+			}
+		}
+		vstate[v.Name] = done
+		return nil
+	}
+	for _, v := range d.Views {
+		if err := visitView(v); err != nil {
 			return err
 		}
 	}

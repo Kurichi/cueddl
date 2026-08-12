@@ -72,6 +72,38 @@ func TestValidateRejectsDanglingReferences(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsOneToOneInterleave(t *testing.T) {
+	const oneToOne = `{
+		"project": "p", "instance": "i", "name": "d",
+		"tables": {
+			"Users": {"name": "Users", "columns": {"UserID": {"name": "UserID", "type": "STRING(36)", "notNull": true}},
+			          "primaryKey": ["UserID"]},
+			"UserExtras": {"name": "UserExtras", "columns": {"UserID": {"name": "UserID", "type": "STRING(36)", "notNull": true}},
+			               "primaryKey": ["UserID"], "interleave": {"parent": "Users", "onDelete": "CASCADE"}}
+		}
+	}`
+	if _, err := DecodeJSON(strings.NewReader(oneToOne)); err != nil {
+		t.Fatalf("1:1 interleave (child PK == parent PK) should be valid, got: %v", err)
+	}
+}
+
+func TestValidateRejectsShorterInterleaveChildKey(t *testing.T) {
+	const tooShort = `{
+		"project": "p", "instance": "i", "name": "d",
+		"tables": {
+			"Users": {"name": "Users", "columns": {
+				"UserID": {"name": "UserID", "type": "STRING(36)", "notNull": true},
+				"OrgID":  {"name": "OrgID", "type": "STRING(36)", "notNull": true}
+			}, "primaryKey": ["UserID", "OrgID"]},
+			"Bad": {"name": "Bad", "columns": {"UserID": {"name": "UserID", "type": "STRING(36)", "notNull": true}},
+			        "primaryKey": ["UserID"], "interleave": {"parent": "Users", "onDelete": "CASCADE"}}
+		}
+	}`
+	if _, err := DecodeJSON(strings.NewReader(tooShort)); err == nil {
+		t.Fatal("expected validation error: child primary key shorter than parent's")
+	}
+}
+
 func TestValidateRejectsDependencyCycle(t *testing.T) {
 	const cyclic = `{
 		"project": "p", "instance": "i", "name": "d",

@@ -225,9 +225,12 @@ func (d *Database) Validate() error {
 			if parent == nil {
 				return fmt.Errorf("table %s: interleave parent %q not declared", t.Name, t.Interleave.Parent)
 			}
-			// Spanner requires the child PK to start with the parent PK.
-			if len(t.PrimaryKey) <= len(parent.PrimaryKey) {
-				return fmt.Errorf("table %s: interleaved child primary key must extend parent %s primary key", t.Name, parent.Name)
+			// Spanner requires the child PK to start with the parent PK; it
+			// may add no columns at all (a 1:1 interleave, e.g. an
+			// extension table sharing its parent's exact key), so only a
+			// strictly shorter child key is invalid.
+			if len(t.PrimaryKey) < len(parent.PrimaryKey) {
+				return fmt.Errorf("table %s: interleaved child primary key must contain parent %s primary key", t.Name, parent.Name)
 			}
 			for i, kp := range parent.PrimaryKey {
 				if t.PrimaryKey[i] != kp {

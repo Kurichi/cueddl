@@ -59,7 +59,26 @@ func CreateTable(t *model.Table) string {
 		stmt += fmt.Sprintf(",\nINTERLEAVE IN PARENT %s ON DELETE %s",
 			Q(t.Interleave.Parent), t.Interleave.OnDelete)
 	}
+	if t.RowDeletionPolicy != nil {
+		stmt += ",\n" + rdpClause(t.RowDeletionPolicy)
+	}
 	return stmt
+}
+
+func rdpClause(p *model.RowDeletionPolicy) string {
+	return fmt.Sprintf("ROW DELETION POLICY (OLDER_THAN(%s, INTERVAL %d DAY))", Q(p.Column), p.Days)
+}
+
+func AddRowDeletionPolicy(table string, p *model.RowDeletionPolicy) string {
+	return fmt.Sprintf("ALTER TABLE %s ADD %s", Q(table), rdpClause(p))
+}
+
+func ReplaceRowDeletionPolicy(table string, p *model.RowDeletionPolicy) string {
+	return fmt.Sprintf("ALTER TABLE %s REPLACE %s", Q(table), rdpClause(p))
+}
+
+func DropRowDeletionPolicy(table string) string {
+	return fmt.Sprintf("ALTER TABLE %s DROP ROW DELETION POLICY", Q(table))
 }
 
 func CreateIndex(table string, idx *model.Index) string {
@@ -165,4 +184,67 @@ func CreateView(v *model.View, orReplace bool) string {
 
 func DropView(name string) string {
 	return "DROP VIEW " + Q(name)
+}
+
+// forClause renders the FOR part of a change stream: FOR ALL, or the
+// watched tables where nil columns means the whole table and an empty
+// slice means primary keys only ("Users()").
+func forClause(cs *model.ChangeStream) string {
+	if cs.ForAll {
+		return "FOR ALL"
+	}
+	targets := make([]string, len(cs.Watch))
+	for i, w := range cs.Watch {
+		targets[i] = Q(w.Table)
+		if w.Columns != nil {
+			cols := make([]string, len(w.Columns))
+			for j, c := range w.Columns {
+				cols[j] = Q(c)
+			}
+			targets[i] += "(" + strings.Join(cols, ", ") + ")"
+		}
+	}
+	return "FOR " + strings.Join(targets, ", ")
+}
+
+// changeStreamOptions renders explicitly set options; withDefaults also
+// emits null for unset ones so ALTER can reset them to Spanner defaults.
+func changeStreamOptions(cs *model.ChangeStream, withDefaults bool) string {
+	var opts []string
+	switch {
+	case cs.RetentionPeriod != "":
+		opts = append(opts, fmt.Sprintf("retention_period = '%s'", cs.RetentionPeriod))
+	case withDefaults:
+		opts = append(opts, "retention_period = null")
+	}
+	switch {
+	case cs.ValueCaptureType != "":
+		opts = append(opts, fmt.Sprintf("value_capture_type = '%s'", cs.ValueCaptureType))
+	case withDefaults:
+		opts = append(opts, "value_capture_type = null")
+	}
+	if len(opts) == 0 {
+		return ""
+	}
+	return "OPTIONS (" + strings.Join(opts, ", ") + ")"
+}
+
+func CreateChangeStream(cs *model.ChangeStream) string {
+	stmt := fmt.Sprintf("CREATE CHANGE STREAM %s %s", Q(cs.Name), forClause(cs))
+	if opts := changeStreamOptions(cs, false); opts != "" {
+		stmt += " " + opts
+	}
+	return stmt
+}
+
+func AlterChangeStreamSetFor(cs *model.ChangeStream) string {
+	return fmt.Sprintf("ALTER CHANGE STREAM %s SET %s", Q(cs.Name), forClause(cs))
+}
+
+func AlterChangeStreamSetOptions(cs *model.ChangeStream) string {
+	return fmt.Sprintf("ALTER CHANGE STREAM %s SET %s", Q(cs.Name), changeStreamOptions(cs, true))
+}
+
+func DropChangeStream(name string) string {
+	return "DROP CHANGE STREAM " + Q(name)
 }

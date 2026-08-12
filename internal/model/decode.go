@@ -43,6 +43,15 @@ func DecodeJSON(r io.Reader) (*Database, error) {
 				db.Views = append(db.Views, v)
 				return nil
 			})
+		case "changeStreams":
+			return decodeObject(dec, func(name string) error {
+				cs := &ChangeStream{}
+				if err := decodeValue(dec, cs); err != nil {
+					return fmt.Errorf("change stream %s: %w", name, err)
+				}
+				db.ChangeStreams = append(db.ChangeStreams, cs)
+				return nil
+			})
 		default:
 			return skipValue(dec)
 		}
@@ -80,6 +89,9 @@ func decodeTable(dec *json.Decoder) (*Table, error) {
 			return decodeValue(dec, &t.DependsOn)
 		case "renamedFrom":
 			return decodeString(dec, &t.RenamedFrom)
+		case "rowDeletionPolicy":
+			t.RowDeletionPolicy = &RowDeletionPolicy{}
+			return decodeValue(dec, t.RowDeletionPolicy)
 		case "indexes":
 			return decodeObject(dec, func(name string) error {
 				idx, err := decodeIndex(dec)

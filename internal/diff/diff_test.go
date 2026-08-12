@@ -274,6 +274,84 @@ func TestColumnDropDeferredAfterViewReplace(t *testing.T) {
 	}
 }
 
+func TestRowDeletionPolicyLifecycle(t *testing.T) {
+	withRDP := func(days int64) *model.Database {
+		u := users()
+		u.Columns = append(u.Columns, &model.Column{Name: "CreatedAt", Type: "TIMESTAMP", NotNull: true})
+		if days > 0 {
+			u.RowDeletionPolicy = &model.RowDeletionPolicy{Column: "CreatedAt", Days: days}
+		}
+		return &model.Database{Tables: []*model.Table{u}}
+	}
+
+	// Inline in CREATE TABLE.
+	p := Diff(withRDP(30), &model.Database{})
+	indexOf(t, sqls(p), "ROW DELETION POLICY (OLDER_THAN(`CreatedAt`, INTERVAL 30 DAY))")
+
+	// Add, replace, drop on an existing table.
+	p = Diff(withRDP(30), withRDP(0))
+	indexOf(t, sqls(p), "ALTER TABLE `Users` ADD ROW DELETION POLICY (OLDER_THAN(`CreatedAt`, INTERVAL 30 DAY))")
+	p = Diff(withRDP(7), withRDP(30))
+	indexOf(t, sqls(p), "ALTER TABLE `Users` REPLACE ROW DELETION POLICY (OLDER_THAN(`CreatedAt`, INTERVAL 7 DAY))")
+	p = Diff(withRDP(0), withRDP(30))
+	indexOf(t, sqls(p), "ALTER TABLE `Users` DROP ROW DELETION POLICY")
+}
+
+func csDB(cs ...*model.ChangeStream) *model.Database {
+	return &model.Database{Tables: []*model.Table{users()}, ChangeStreams: cs}
+}
+
+func TestChangeStreamLifecycle(t *testing.T) {
+	watchUsers := &model.ChangeStream{Name: "S", Watch: []model.ChangeStreamTarget{{Table: "Users"}}}
+
+	// Create with options, after tables.
+	full := &model.ChangeStream{Name: "S", ForAll: true, RetentionPeriod: "36h", ValueCaptureType: "NEW_ROW"}
+	p := Diff(csDB(full), &model.Database{})
+	stmts := sqls(p)
+	if indexOf(t, stmts, "CREATE CHANGE STREAM `S` FOR ALL OPTIONS (retention_period = '36h', value_capture_type = 'NEW_ROW')") <
+		indexOf(t, stmts, "CREATE TABLE `Users`") {
+		t.Error("change stream must be created after tables")
+	}
+
+	// Retarget: existing targets -> altered early (first statement).
+	p = Diff(csDB(watchUsers), csDB(full))
+	if sqls(p)[0] != "ALTER CHANGE STREAM `S` SET FOR `Users`" {
+		t.Errorf("retarget to existing tables should come first, got %v", sqls(p))
+	}
+	// Options reset to defaults via null.
+	indexOf(t, sqls(p), "ALTER CHANGE STREAM `S` SET OPTIONS (retention_period = null, value_capture_type = null)")
+
+	// Removed stream is dropped first.
+	p = Diff(&model.Database{Tables: []*model.Table{users()}}, csDB(watchUsers))
+	if sqls(p)[0] != "DROP CHANGE STREAM `S`" {
+		t.Errorf("removed stream must be dropped first, got %v", sqls(p))
+	}
+}
+
+func TestChangeStreamRetargetToNewColumnComesLate(t *testing.T) {
+	// The stream starts watching whole Users, then narrows to a column
+	// that does not exist yet: SET FOR must come after ADD COLUMN.
+	actual := csDB(&model.ChangeStream{Name: "S", Watch: []model.ChangeStreamTarget{{Table: "Users"}}})
+	desired := csDB(&model.ChangeStream{Name: "S", Watch: []model.ChangeStreamTarget{{Table: "Users", Columns: []string{"Name"}}}})
+	desired.Tables[0].Columns = append(desired.Tables[0].Columns, &model.Column{Name: "Name", Type: "STRING(MAX)"})
+	p := Diff(desired, actual)
+	stmts := sqls(p)
+	if indexOf(t, stmts, "SET FOR `Users`(`Name`)") < indexOf(t, stmts, "ADD COLUMN `Name`") {
+		t.Errorf("retarget needing a new column must come after the column exists:\n%s", strings.Join(stmts, "\n"))
+	}
+}
+
+func TestChangeStreamKeysOnlyVsAllColumns(t *testing.T) {
+	keysOnly := csDB(&model.ChangeStream{Name: "S", Watch: []model.ChangeStreamTarget{{Table: "Users", Columns: []string{}}}})
+	allCols := csDB(&model.ChangeStream{Name: "S", Watch: []model.ChangeStreamTarget{{Table: "Users"}}})
+
+	p := Diff(keysOnly, allCols)
+	indexOf(t, sqls(p), "SET FOR `Users`()")
+	if p := Diff(keysOnly, keysOnly); len(p.Statements) != 0 {
+		t.Errorf("keys-only watch must be idempotent, got %v", sqls(p))
+	}
+}
+
 func TestDefaultChange(t *testing.T) {
 	desired := &model.Database{Tables: []*model.Table{users()}}
 	desired.Tables[0].Columns[1].Default = `"unknown"`

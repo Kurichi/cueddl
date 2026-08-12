@@ -52,11 +52,14 @@ database: schema.#Database & {
 			// but demonstrates explicit creation-order control.
 			dependsOn: ["Users"]
 			columns: {
-				LogID:   {type: "STRING(36)", notNull: true}
-				UserID:  {type: "STRING(36)", notNull: true}
-				Payload: {type: "JSON"}
+				LogID:     {type: "STRING(36)", notNull: true}
+				UserID:    {type: "STRING(36)", notNull: true}
+				Payload:   {type: "JSON"}
+				CreatedAt: {type: "TIMESTAMP", notNull: true, default: "CURRENT_TIMESTAMP()"}
 			}
 			primaryKey: ["LogID"]
+			// TTL: logs older than 90 days are deleted in the background.
+			rowDeletionPolicy: {column: "CreatedAt", days: 90}
 			foreignKeys: {
 				FK_AuditLogs_Users: {
 					columns: ["UserID"]
@@ -73,6 +76,12 @@ database: schema.#Database & {
 		UserEmails: {
 			definition: "SELECT u.UserID, u.Email FROM Users AS u"
 			dependsOn: ["Users"]
+		}
+	}
+
+	changeStreams: {
+		UsersStream: {
+			watch: [{table: "Users"}]
 		}
 	}
 }

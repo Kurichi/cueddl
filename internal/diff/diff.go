@@ -49,17 +49,38 @@ func (p *Plan) HasDestructive() bool {
 func Diff(desired, actual *model.Database) *Plan {
 	p := &Plan{}
 
-	// Phase 0: drop removed views. They must go before table renames and
-	// drops, since a view blocks DDL on anything it references.
+	// Phase 0: drop removed views and change streams. Both block DDL on
+	// what they reference, so they must go before table renames and drops.
 	for _, av := range actual.Views {
 		if desired.View(av.Name) == nil {
 			p.add(ddlgen.DropView(av.Name))
+		}
+	}
+	for _, acs := range actual.ChangeStreams {
+		if desired.ChangeStream(acs.Name) == nil {
+			p.add(ddlgen.DropChangeStream(acs.Name))
 		}
 	}
 
 	// Phase 0.5: renames. The actual model is rewritten to the new names
 	// so the rest of the diff sees the renamed table as the same table.
 	applyRenames(p, desired, actual)
+
+	// Phase 0.75: retarget change streams whose new watch list only needs
+	// what already exists. Doing it here unblocks upcoming table drops; a
+	// stream that needs not-yet-created tables or columns is altered late.
+	lateStreamRetargets := map[string]bool{}
+	for _, dcs := range desired.ChangeStreams {
+		acs := actual.ChangeStream(dcs.Name)
+		if acs == nil || csWatchEqual(dcs, acs) {
+			continue
+		}
+		if csTargetsExist(dcs, actual) {
+			p.add(ddlgen.AlterChangeStreamSetFor(dcs))
+		} else {
+			lateStreamRetargets[dcs.Name] = true
+		}
+	}
 
 	dropped := map[string]bool{}
 	for _, t := range actual.Tables {
@@ -151,7 +172,25 @@ func Diff(desired, actual *model.Database) *Plan {
 		}
 	}
 
-	// Phase 8: column drops, deferred until stale view definitions are gone.
+	// Phase 7.5: change streams — create new ones, finish deferred
+	// retargets, and update options. Runs after every table and column
+	// they might watch exists.
+	for _, dcs := range desired.ChangeStreams {
+		acs := actual.ChangeStream(dcs.Name)
+		if acs == nil {
+			p.add(ddlgen.CreateChangeStream(dcs))
+			continue
+		}
+		if lateStreamRetargets[dcs.Name] {
+			p.add(ddlgen.AlterChangeStreamSetFor(dcs))
+		}
+		if dcs.RetentionPeriod != acs.RetentionPeriod || dcs.ValueCaptureType != acs.ValueCaptureType {
+			p.add(ddlgen.AlterChangeStreamSetOptions(dcs))
+		}
+	}
+
+	// Phase 8: column drops, deferred until stale view definitions and
+	// change stream watch lists no longer reference them.
 	for _, sql := range p.deferredColumnDrops {
 		p.addDestructive(sql)
 	}
@@ -182,6 +221,13 @@ func applyRenames(p *Plan, desired, actual *model.Database) {
 			for _, fk := range t.ForeignKeys {
 				if fk.RefTable == oldName {
 					fk.RefTable = dt.Name
+				}
+			}
+		}
+		for _, cs := range actual.ChangeStreams {
+			for i := range cs.Watch {
+				if cs.Watch[i].Table == oldName {
+					cs.Watch[i].Table = dt.Name
 				}
 			}
 		}
@@ -222,6 +268,16 @@ func diffTable(p *Plan, dt, at *model.Table) {
 			p.add(ddlgen.SetColumnOptions(dt.Name, dc))
 		}
 	}
+
+	dp, ap := dt.RowDeletionPolicy, at.RowDeletionPolicy
+	switch {
+	case dp != nil && ap == nil:
+		p.add(ddlgen.AddRowDeletionPolicy(dt.Name, dp))
+	case dp == nil && ap != nil:
+		p.add(ddlgen.DropRowDeletionPolicy(dt.Name))
+	case dp != nil && *dp != *ap:
+		p.add(ddlgen.ReplaceRowDeletionPolicy(dt.Name, dp))
+	}
 }
 
 func interleaveEqual(a, b *model.Interleave) bool {
@@ -252,6 +308,44 @@ func checkEqual(a, b *model.Check) bool {
 func viewEqual(a, b *model.View) bool {
 	return a.SecurityType == b.SecurityType &&
 		model.NormalizeExpr(a.Definition) == model.NormalizeExpr(b.Definition)
+}
+
+// csWatchEqual compares watch targets as a set keyed by table, since
+// INFORMATION_SCHEMA returns them sorted while CUE keeps user order.
+// Column lists distinguish nil (all columns) from empty (keys only).
+func csWatchEqual(a, b *model.ChangeStream) bool {
+	if a.ForAll != b.ForAll || len(a.Watch) != len(b.Watch) {
+		return false
+	}
+	byTable := map[string]model.ChangeStreamTarget{}
+	for _, w := range b.Watch {
+		byTable[w.Table] = w
+	}
+	for _, w := range a.Watch {
+		other, ok := byTable[w.Table]
+		if !ok || (w.Columns == nil) != (other.Columns == nil) || !sameSet(w.Columns, other.Columns) {
+			return false
+		}
+	}
+	return true
+}
+
+// csTargetsExist reports whether every watched table and column already
+// exists in the given schema, i.e. the stream can be retargeted before
+// new tables and columns are created.
+func csTargetsExist(cs *model.ChangeStream, db *model.Database) bool {
+	for _, w := range cs.Watch {
+		t := db.Table(w.Table)
+		if t == nil {
+			return false
+		}
+		for _, col := range w.Columns {
+			if t.Column(col) == nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // topoViews orders views so dependsOn targets precede their dependents;

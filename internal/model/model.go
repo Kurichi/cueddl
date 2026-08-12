@@ -11,11 +11,12 @@ import (
 )
 
 type Database struct {
-	Project  string
-	Instance string
-	Name     string
-	Tables   []*Table // declaration order
-	Views    []*View
+	Project       string
+	Instance      string
+	Name          string
+	Tables        []*Table // declaration order
+	Views         []*View
+	ChangeStreams []*ChangeStream
 }
 
 type Table struct {
@@ -32,7 +33,32 @@ type Table struct {
 	// RenamedFrom names the table this one was renamed from. The diff
 	// emits a rename instead of drop + create when the old name still
 	// exists in the live schema.
-	RenamedFrom string
+	RenamedFrom       string
+	RowDeletionPolicy *RowDeletionPolicy
+}
+
+// RowDeletionPolicy is Spanner TTL: rows with Column older than Days
+// days are deleted in the background.
+type RowDeletionPolicy struct {
+	Column string
+	Days   int64
+}
+
+type ChangeStream struct {
+	Name   string
+	ForAll bool
+	Watch  []ChangeStreamTarget
+	// RetentionPeriod and ValueCaptureType are empty when unset, meaning
+	// Spanner defaults ("1d" / OLD_AND_NEW_VALUES).
+	RetentionPeriod  string
+	ValueCaptureType string
+}
+
+// ChangeStreamTarget watches one table. Columns nil watches every column;
+// an explicitly empty slice watches primary keys only.
+type ChangeStreamTarget struct {
+	Table   string
+	Columns []string
 }
 
 type Column struct {
@@ -95,6 +121,15 @@ func (d *Database) View(name string) *View {
 	for _, v := range d.Views {
 		if v.Name == name {
 			return v
+		}
+	}
+	return nil
+}
+
+func (d *Database) ChangeStream(name string) *ChangeStream {
+	for _, cs := range d.ChangeStreams {
+		if cs.Name == name {
+			return cs
 		}
 	}
 	return nil
@@ -223,6 +258,16 @@ func (d *Database) Validate() error {
 					t.Name, c.Name, c.Type)
 			}
 		}
+		if rdp := t.RowDeletionPolicy; rdp != nil {
+			c := t.Column(rdp.Column)
+			if c == nil {
+				return fmt.Errorf("table %s: rowDeletionPolicy column %q not declared", t.Name, rdp.Column)
+			}
+			if c.Type != "TIMESTAMP" {
+				return fmt.Errorf("table %s: rowDeletionPolicy column %q must be TIMESTAMP, got %s",
+					t.Name, rdp.Column, c.Type)
+			}
+		}
 		for _, fk := range t.ForeignKeys {
 			for _, c := range fk.Columns {
 				if t.Column(c) == nil {
@@ -247,6 +292,25 @@ func (d *Database) Validate() error {
 		for _, dep := range v.DependsOn {
 			if d.Table(dep) == nil && d.View(dep) == nil {
 				return fmt.Errorf("view %s: dependsOn target %q not declared", v.Name, dep)
+			}
+		}
+	}
+	for _, cs := range d.ChangeStreams {
+		if cs.ForAll && len(cs.Watch) > 0 {
+			return fmt.Errorf("change stream %s: forAll and watch are mutually exclusive", cs.Name)
+		}
+		if !cs.ForAll && len(cs.Watch) == 0 {
+			return fmt.Errorf("change stream %s: either forAll or watch is required", cs.Name)
+		}
+		for _, w := range cs.Watch {
+			t := d.Table(w.Table)
+			if t == nil {
+				return fmt.Errorf("change stream %s: watched table %q not declared", cs.Name, w.Table)
+			}
+			for _, col := range w.Columns {
+				if t.Column(col) == nil {
+					return fmt.Errorf("change stream %s: watched column %s.%q not declared", cs.Name, w.Table, col)
+				}
 			}
 		}
 	}

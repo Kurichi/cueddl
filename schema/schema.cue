@@ -74,6 +74,34 @@ package schema
 	onDelete: *"NO ACTION" | "CASCADE"
 }
 
+// #RowDeletionPolicy deletes rows whose TIMESTAMP column is older than
+// the given number of days (Spanner TTL supports DAY granularity only).
+#RowDeletionPolicy: {
+	column!: string
+	days!:   int & >=0
+}
+
+// #ChangeStreamTarget watches one table. Omit columns to watch every
+// column; an explicitly empty list watches primary keys only.
+#ChangeStreamTarget: {
+	table!: string
+	columns?: [...string]
+}
+
+// #ChangeStream captures data changes for the watched tables.
+#ChangeStream: {
+	// name is filled in from the struct key in #Database.changeStreams.
+	name!: string
+	// forAll watches every table in the database; mutually exclusive
+	// with watch.
+	forAll: *false | bool
+	watch?: [...#ChangeStreamTarget] & [_, ...]
+	// retentionPeriod is e.g. "24h" or "7d" (Spanner default: "1d").
+	retentionPeriod?: string
+	valueCaptureType?: "OLD_AND_NEW_VALUES" | "NEW_VALUES" | "NEW_ROW" | "NEW_ROW_AND_OLD_VALUES"
+	if forAll {watch?: _|_}
+}
+
 // #Table is a Spanner table.
 #Table: {
 	name!: string
@@ -91,6 +119,7 @@ package schema
 	// diff emits ALTER TABLE ... RENAME TO instead of DROP + CREATE (which
 	// would lose data). Remove the hint once every environment is migrated.
 	renamedFrom?: string
+	rowDeletionPolicy?: #RowDeletionPolicy
 }
 
 // #View is a SQL view over tables or other views.
@@ -113,4 +142,5 @@ package schema
 	name!:     string
 	tables: [Name=string]: #Table & {name: Name}
 	views: [Name=string]: #View & {name: Name}
+	changeStreams: [Name=string]: #ChangeStream & {name: Name}
 }

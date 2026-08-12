@@ -5,6 +5,8 @@ package introspect
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"cloud.google.com/go/spanner"
@@ -19,16 +21,16 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 	db := &model.Database{}
 	tables := map[string]*model.Table{}
 
-	// Tables and interleave relationships.
+	// Tables, interleave relationships, and row deletion policies.
 	err := query(ctx, client, `
-		SELECT t.table_name, t.parent_table_name, t.on_delete_action
+		SELECT t.table_name, t.parent_table_name, t.on_delete_action, t.row_deletion_policy_expression
 		FROM information_schema.tables AS t
 		WHERE t.table_schema = '' AND t.table_type = 'BASE TABLE'
 		ORDER BY t.table_name`,
 		func(row *spanner.Row) error {
 			var name string
-			var parent, onDelete spanner.NullString
-			if err := row.Columns(&name, &parent, &onDelete); err != nil {
+			var parent, onDelete, rdp spanner.NullString
+			if err := row.Columns(&name, &parent, &onDelete, &rdp); err != nil {
 				return err
 			}
 			t := &model.Table{Name: name}
@@ -37,6 +39,13 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 				if onDelete.Valid {
 					t.Interleave.OnDelete = onDelete.StringVal
 				}
+			}
+			if rdp.Valid {
+				policy, err := parseRowDeletionPolicy(rdp.StringVal)
+				if err != nil {
+					return fmt.Errorf("table %s: %w", name, err)
+				}
+				t.RowDeletionPolicy = policy
 			}
 			tables[name] = t
 			db.Tables = append(db.Tables, t)
@@ -301,7 +310,128 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 		}
 	}
 
+	// Change streams: watch targets and options come from three tables.
+	streams := map[string]*model.ChangeStream{}
+	// ALL is documented as STRING ("YES"/"NO") but the emulator returns
+	// BOOL; CAST normalizes both to a string.
+	err = query(ctx, client, `
+		SELECT cs.change_stream_name, CAST(cs.all AS STRING)
+		FROM information_schema.change_streams AS cs
+		WHERE cs.change_stream_schema = ''
+		ORDER BY cs.change_stream_name`,
+		func(row *spanner.Row) error {
+			var name, all string
+			if err := row.Columns(&name, &all); err != nil {
+				return err
+			}
+			cs := &model.ChangeStream{Name: name, ForAll: isTrue(all)}
+			streams[name] = cs
+			db.ChangeStreams = append(db.ChangeStreams, cs)
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("introspect change streams: %w", err)
+	}
+
+	if len(streams) > 0 {
+		// Explicitly watched columns, keyed by stream and table.
+		watchedCols := map[string][]string{} // "stream\x00table" -> columns
+		err = query(ctx, client, `
+			SELECT c.change_stream_name, c.table_name, c.column_name
+			FROM information_schema.change_stream_columns AS c
+			WHERE c.change_stream_schema = ''
+			ORDER BY c.change_stream_name, c.table_name, c.column_name`,
+			func(row *spanner.Row) error {
+				var stream, table, column string
+				if err := row.Columns(&stream, &table, &column); err != nil {
+					return err
+				}
+				key := stream + "\x00" + table
+				watchedCols[key] = append(watchedCols[key], column)
+				return nil
+			})
+		if err != nil {
+			return nil, fmt.Errorf("introspect change stream columns: %w", err)
+		}
+
+		err = query(ctx, client, `
+			SELECT t.change_stream_name, t.table_name, CAST(t.all_columns AS STRING)
+			FROM information_schema.change_stream_tables AS t
+			WHERE t.change_stream_schema = ''
+			ORDER BY t.change_stream_name, t.table_name`,
+			func(row *spanner.Row) error {
+				var stream, table, allColumns string
+				if err := row.Columns(&stream, &table, &allColumns); err != nil {
+					return err
+				}
+				cs := streams[stream]
+				if cs == nil || cs.ForAll {
+					return nil
+				}
+				target := model.ChangeStreamTarget{Table: table}
+				if !isTrue(allColumns) {
+					// Distinguish "primary keys only" (empty, non-nil)
+					// from "all columns" (nil).
+					cols := watchedCols[stream+"\x00"+table]
+					if cols == nil {
+						cols = []string{}
+					}
+					target.Columns = cols
+				}
+				cs.Watch = append(cs.Watch, target)
+				return nil
+			})
+		if err != nil {
+			return nil, fmt.Errorf("introspect change stream tables: %w", err)
+		}
+
+		err = query(ctx, client, `
+			SELECT o.change_stream_name, o.option_name, o.option_value
+			FROM information_schema.change_stream_options AS o
+			WHERE o.change_stream_schema = ''`,
+			func(row *spanner.Row) error {
+				var stream, name, value string
+				if err := row.Columns(&stream, &name, &value); err != nil {
+					return err
+				}
+				cs := streams[stream]
+				if cs == nil {
+					return nil
+				}
+				switch name {
+				case "retention_period":
+					cs.RetentionPeriod = value
+				case "value_capture_type":
+					cs.ValueCaptureType = value
+				}
+				return nil
+			})
+		if err != nil {
+			return nil, fmt.Errorf("introspect change stream options: %w", err)
+		}
+	}
+
 	return db, nil
+}
+
+var rdpPattern = regexp.MustCompile("(?i)OLDER_THAN\\s*\\(\\s*`?([^,`\\s)]+)`?\\s*,\\s*INTERVAL\\s+(\\d+)\\s+DAY\\s*\\)")
+
+// isTrue accepts both the documented "YES"/"NO" strings and the
+// emulator's CAST BOOL results "true"/"false".
+func isTrue(s string) bool {
+	return strings.EqualFold(s, "YES") || strings.EqualFold(s, "TRUE")
+}
+
+func parseRowDeletionPolicy(expr string) (*model.RowDeletionPolicy, error) {
+	m := rdpPattern.FindStringSubmatch(expr)
+	if m == nil {
+		return nil, fmt.Errorf("unsupported row deletion policy expression %q", expr)
+	}
+	days, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &model.RowDeletionPolicy{Column: m[1], Days: days}, nil
 }
 
 func query(ctx context.Context, client *spanner.Client, sql string, fn func(*spanner.Row) error) error {

@@ -67,4 +67,13 @@ database: schema.#Database & {
 			dependsOn: ["Users"]
 		}
 	}
+
+	changeStreams: {
+		// Narrowed to specific columns (Name is brand new, so the SET FOR
+		// runs after ADD COLUMN) and retention extended -> SET OPTIONS.
+		UsersStream: {
+			watch: [{table: "Users", columns: ["Email", "Name"]}]
+			retentionPeriod: "48h"
+		}
+	}
 }

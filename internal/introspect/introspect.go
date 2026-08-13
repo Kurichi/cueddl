@@ -55,9 +55,13 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 		return nil, fmt.Errorf("introspect tables: %w", err)
 	}
 
-	// Columns in ordinal order.
+	// Columns in ordinal order. is_generated is "ALWAYS" for a STORED
+	// generated column (Spanner has no virtual/non-stored generated
+	// columns), "NEVER" otherwise; generation_expression is only set
+	// alongside it.
 	err = query(ctx, client, `
-		SELECT c.table_name, c.column_name, c.spanner_type, c.is_nullable, c.column_default
+		SELECT c.table_name, c.column_name, c.spanner_type, c.is_nullable, c.column_default,
+		       c.is_generated, c.generation_expression
 		FROM information_schema.columns AS c
 		JOIN information_schema.tables AS t
 		  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -65,20 +69,25 @@ func Introspect(ctx context.Context, client *spanner.Client) (*model.Database, e
 		ORDER BY c.table_name, c.ordinal_position`,
 		func(row *spanner.Row) error {
 			var table, name, typ, nullable string
-			var def spanner.NullString
-			if err := row.Columns(&table, &name, &typ, &nullable, &def); err != nil {
+			var def, isGenerated, genExpr spanner.NullString
+			if err := row.Columns(&table, &name, &typ, &nullable, &def, &isGenerated, &genExpr); err != nil {
 				return err
 			}
 			t := tables[table]
 			if t == nil {
 				return nil
 			}
-			t.Columns = append(t.Columns, &model.Column{
+			col := &model.Column{
 				Name:    name,
 				Type:    model.NormalizeType(typ),
 				NotNull: nullable == "NO",
 				Default: def.StringVal,
-			})
+			}
+			if isGenerated.Valid && strings.EqualFold(isGenerated.StringVal, "ALWAYS") && genExpr.Valid {
+				col.Generated = &model.GeneratedColumn{Expression: genExpr.StringVal}
+				col.Default = ""
+			}
+			t.Columns = append(t.Columns, col)
 			return nil
 		})
 	if err != nil {

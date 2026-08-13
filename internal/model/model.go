@@ -68,6 +68,15 @@ type Column struct {
 	Default string // GoogleSQL expression; empty means no default
 	// AllowCommitTimestamp maps to OPTIONS (allow_commit_timestamp=true).
 	AllowCommitTimestamp bool
+	// Generated marks this as a STORED generated column. Mutually
+	// exclusive with Default.
+	Generated *GeneratedColumn
+}
+
+// GeneratedColumn is a STORED generated column: AS (Expression) STORED.
+// Spanner does not support non-stored (virtual) generated columns.
+type GeneratedColumn struct {
+	Expression string
 }
 
 type View struct {
@@ -259,6 +268,9 @@ func (d *Database) Validate() error {
 			if c.AllowCommitTimestamp && c.Type != "TIMESTAMP" {
 				return fmt.Errorf("table %s: column %q: allowCommitTimestamp requires type TIMESTAMP, got %s",
 					t.Name, c.Name, c.Type)
+			}
+			if c.Generated != nil && c.Default != "" {
+				return fmt.Errorf("table %s: column %q: generated and default are mutually exclusive", t.Name, c.Name)
 			}
 		}
 		if rdp := t.RowDeletionPolicy; rdp != nil {

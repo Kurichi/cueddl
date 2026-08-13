@@ -352,6 +352,47 @@ func TestChangeStreamKeysOnlyVsAllColumns(t *testing.T) {
 	}
 }
 
+func TestGeneratedColumnLifecycle(t *testing.T) {
+	withGenerated := func(expr string) *model.Database {
+		u := users()
+		c := &model.Column{Name: "Domain", Type: "STRING(MAX)", NotNull: true}
+		if expr != "" {
+			c.Generated = &model.GeneratedColumn{Expression: expr}
+		}
+		u.Columns = append(u.Columns, c)
+		return &model.Database{Tables: []*model.Table{u}}
+	}
+
+	// New table: generated column is inline in CREATE TABLE.
+	p := Diff(withGenerated("SUBSTR(Email, 5)"), &model.Database{})
+	indexOf(t, sqls(p), "`Domain` STRING(MAX) NOT NULL AS (SUBSTR(Email, 5)) STORED")
+
+	// Adding a generated column to an existing table.
+	p = Diff(withGenerated("SUBSTR(Email, 5)"), &model.Database{Tables: []*model.Table{users()}})
+	indexOf(t, sqls(p), "ADD COLUMN `Domain` STRING(MAX) NOT NULL AS (SUBSTR(Email, 5)) STORED")
+
+	// Changing the expression of an existing generated column re-states it.
+	p = Diff(withGenerated("SUBSTR(Email, 6)"), withGenerated("SUBSTR(Email, 5)"))
+	indexOf(t, sqls(p), "ALTER COLUMN `Domain` STRING(MAX) NOT NULL AS (SUBSTR(Email, 6)) STORED")
+
+	// No expression change: idempotent.
+	if p := Diff(withGenerated("SUBSTR(Email, 5)"), withGenerated("SUBSTR(Email, 5)")); len(p.Statements) != 0 {
+		t.Errorf("unchanged generated column must be a no-op, got %v", sqls(p))
+	}
+
+	// Converting between generated and regular requires recreating the
+	// column: warned, not planned.
+	p = Diff(withGenerated("SUBSTR(Email, 5)"), withGenerated(""))
+	if len(p.Warnings) == 0 {
+		t.Fatal("expected a warning about generated<->regular conversion")
+	}
+	for _, s := range sqls(p) {
+		if strings.Contains(s, "`Domain`") {
+			t.Errorf("generated<->regular conversion must not produce DDL, got %q", s)
+		}
+	}
+}
+
 func TestDefaultChange(t *testing.T) {
 	desired := &model.Database{Tables: []*model.Table{users()}}
 	desired.Tables[0].Columns[1].Default = `"unknown"`

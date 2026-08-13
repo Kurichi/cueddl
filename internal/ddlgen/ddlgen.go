@@ -32,7 +32,10 @@ func ColumnDef(c *model.Column) string {
 	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}
-	if c.Default != "" {
+	switch {
+	case c.Generated != nil:
+		fmt.Fprintf(&b, " AS (%s) STORED", c.Generated.Expression)
+	case c.Default != "":
 		fmt.Fprintf(&b, " DEFAULT (%s)", c.Default)
 	}
 	if c.AllowCommitTimestamp {
@@ -114,11 +117,16 @@ func DropColumn(table, column string) string {
 }
 
 // AlterColumn re-states type and nullability; Spanner requires the full
-// column definition (minus default) in ALTER COLUMN.
+// column definition (minus default) in ALTER COLUMN. A generated column
+// re-states its expression too, so this also alters an existing
+// generated column's expression.
 func AlterColumn(table string, c *model.Column) string {
 	def := Q(c.Name) + " " + c.Type
 	if c.NotNull {
 		def += " NOT NULL"
+	}
+	if c.Generated != nil {
+		def += fmt.Sprintf(" AS (%s) STORED", c.Generated.Expression)
 	}
 	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s", Q(table), def)
 }

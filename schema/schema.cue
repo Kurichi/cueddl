@@ -31,6 +31,16 @@ package schema
 			type: "TIMESTAMP"
 		}
 	}
+	// generated declares this column as computed from other columns in
+	// the same row (AS (expression) STORED). Spanner only supports
+	// STORED generated columns, not virtual ones. Mutually exclusive
+	// with default.
+	generated?: {
+		expression!: string
+	}
+	if generated != _|_ {
+		default?: _|_
+	}
 }
 
 // #KeyPart is one component of a primary key or index key.

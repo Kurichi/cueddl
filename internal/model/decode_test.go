@@ -104,6 +104,42 @@ func TestValidateRejectsShorterInterleaveChildKey(t *testing.T) {
 	}
 }
 
+func TestDecodeGeneratedColumn(t *testing.T) {
+	const withGenerated = `{
+		"project": "p", "instance": "i", "name": "d",
+		"tables": {
+			"KeibaRaces": {"name": "KeibaRaces", "columns": {
+				"RaceId": {"name": "RaceId", "type": "STRING(12)", "notNull": true},
+				"Date":   {"name": "Date", "type": "STRING(8)", "notNull": true,
+				           "generated": {"expression": "SUBSTR(RaceId, 5, 8)"}}
+			}, "primaryKey": ["RaceId"]}
+		}
+	}`
+	db, err := DecodeJSON(strings.NewReader(withGenerated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := db.Table("KeibaRaces").Column("Date")
+	if date.Generated == nil || date.Generated.Expression != "SUBSTR(RaceId, 5, 8)" {
+		t.Errorf("generated = %+v", date.Generated)
+	}
+}
+
+func TestValidateRejectsGeneratedWithDefault(t *testing.T) {
+	const both = `{
+		"project": "p", "instance": "i", "name": "d",
+		"tables": {
+			"T": {"name": "T", "columns": {
+				"A": {"name": "A", "type": "INT64", "default": "0",
+				      "generated": {"expression": "1"}}
+			}, "primaryKey": ["A"]}
+		}
+	}`
+	if _, err := DecodeJSON(strings.NewReader(both)); err == nil {
+		t.Fatal("expected validation error: generated and default are mutually exclusive")
+	}
+}
+
 func TestValidateRejectsDependencyCycle(t *testing.T) {
 	const cyclic = `{
 		"project": "p", "instance": "i", "name": "d",

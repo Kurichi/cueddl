@@ -258,7 +258,11 @@ func diffTable(p *Plan, dt, at *model.Table) {
 			p.add(ddlgen.AddColumn(dt.Name, dc))
 			continue
 		}
-		if dc.Type != ac.Type || dc.NotNull != ac.NotNull {
+		switch {
+		case (dc.Generated == nil) != (ac.Generated == nil):
+			p.warnf("table %s: column %q changing between generated and regular requires recreating the column; skipped",
+				dt.Name, dc.Name)
+		case dc.Type != ac.Type || dc.NotNull != ac.NotNull || !generatedEqual(dc.Generated, ac.Generated):
 			p.add(ddlgen.AlterColumn(dt.Name, dc))
 		}
 		if model.NormalizeExpr(dc.Default) != model.NormalizeExpr(ac.Default) {
@@ -278,6 +282,13 @@ func diffTable(p *Plan, dt, at *model.Table) {
 	case dp != nil && *dp != *ap:
 		p.add(ddlgen.ReplaceRowDeletionPolicy(dt.Name, dp))
 	}
+}
+
+func generatedEqual(a, b *model.GeneratedColumn) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || model.NormalizeExpr(a.Expression) == model.NormalizeExpr(b.Expression)
 }
 
 func interleaveEqual(a, b *model.Interleave) bool {

@@ -6,6 +6,12 @@
 //
 // The desired schema (a concrete schema.#Database value) arrives as JSON on
 // stdin; connection coordinates are part of that value.
+//
+// `plan --against <file>` diffs desired against another exported schema
+// JSON file instead of the live database, making no Spanner connection at
+// all — useful for seeing what changed since some other schema state (e.g.
+// a past git commit) without needing two real databases. Not available for
+// apply, which always targets the live database.
 package main
 
 import (
@@ -41,6 +47,8 @@ func run() error {
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	allowDestructive := fs.Bool("allow-destructive", false, "permit DROP TABLE / DROP COLUMN statements")
+	against := fs.String("against", "", "plan only: diff desired against another exported schema JSON file "+
+		"(e.g. `git show <ref>:path | cue export ...`) instead of the live database; no Spanner connection is made")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -59,8 +67,11 @@ func run() error {
 	ctx := context.Background()
 	switch cmd {
 	case "plan":
-		return plan(ctx, desired, os.Stdout)
+		return plan(ctx, desired, os.Stdout, *against)
 	case "apply":
+		if *against != "" {
+			return fmt.Errorf("--against is only supported for plan: apply always targets the live database")
+		}
 		return apply(ctx, desired, *allowDestructive, os.Stdout)
 	default:
 		return fmt.Errorf("unknown command %q (want plan or apply)", cmd)
@@ -137,13 +148,37 @@ func printPlan(w *os.File, p *diff.Plan, dbExists bool, d *model.Database) {
 	}
 }
 
-func plan(ctx context.Context, desired *model.Database, w *os.File) error {
+func plan(ctx context.Context, desired *model.Database, w *os.File, against string) error {
+	if against != "" {
+		p, err := computePlanAgainstFile(desired, against)
+		if err != nil {
+			return err
+		}
+		printPlan(w, p, true, desired)
+		return nil
+	}
 	p, exists, err := computePlan(ctx, desired)
 	if err != nil {
 		return err
 	}
 	printPlan(w, p, exists, desired)
 	return nil
+}
+
+// computePlanAgainstFile diffs desired against a schema JSON file exported
+// at some other point (typically a past git commit's CUE), instead of the
+// live database. No Spanner connection is made.
+func computePlanAgainstFile(desired *model.Database, path string) (*diff.Plan, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open --against file: %w", err)
+	}
+	defer f.Close()
+	actual, err := model.DecodeJSON(f)
+	if err != nil {
+		return nil, fmt.Errorf("decode --against schema: %w", err)
+	}
+	return diff.Diff(desired, actual), nil
 }
 
 func apply(ctx context.Context, desired *model.Database, allowDestructive bool, w *os.File) error {

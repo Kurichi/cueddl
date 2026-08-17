@@ -196,6 +196,22 @@ Plan: 3 statement(s), 1 destructive
 認証は通常の Google Cloud のクレデンシャル (ADC) を使用します。
 `SPANNER_EMULATOR_HOST` が設定されていれば emulator に接続します。
 
+### 実DBの代わりに別のスキーマと比較する (`plan --against`)
+
+`plan` は `--against <file>` を渡すと、実DBには一切接続せず、指定した JSON ファイル
+(過去の `cue export` 結果) を比較対象にします。あるコミット時点のスキーマと
+現在の差分だけを見たい場合などに使えます (`apply` では使えません)。
+
+```sh
+# schema ディレクトリは他ファイル (共有テーブル定義など) を import する
+# ことがあるため、git show で単一ファイルだけ取り出すのではなく worktree
+# でその時点のツリー全体を用意する。
+git worktree add /tmp/old-schema <commit>
+go tool cue export /tmp/old-schema/path/to/schema -e database > /tmp/old.json
+
+go tool cue export . -e database | go tool cueddl plan --against /tmp/old.json
+```
+
 ## ローカルで試す (emulator)
 
 ```sh

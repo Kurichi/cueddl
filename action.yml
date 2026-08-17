@@ -1,0 +1,99 @@
+name: 'cueddl plan (against a git ref)'
+description: >-
+  Diffs a cueddl schema against the same schema path at another git ref
+  (e.g. a PR's base commit) with no live database or credentials required.
+  Wraps scripts/plan-against-commit.sh.
+inputs:
+  schema-path:
+    description: 'Path to the CUE package holding the `database` value.'
+    required: false
+    default: '.'
+  against-ref:
+    description: >-
+      Git ref to diff against, e.g. ${{ github.event.pull_request.base.sha }}.
+    required: true
+outputs:
+  plan:
+    description: 'Full text output of the plan (same format as `cueddl plan`).'
+    value: ${{ steps.plan.outputs.plan }}
+  has-changes:
+    description: '"true" if the plan is non-empty.'
+    value: ${{ steps.plan.outputs.has-changes }}
+  has-destructive:
+    description: '"true" if the plan contains a destructive statement (DROP TABLE / DROP COLUMN).'
+    value: ${{ steps.plan.outputs.has-destructive }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Fetch against-ref
+      shell: bash
+      env:
+        AGAINST_REF: ${{ inputs.against-ref }}
+      run: git fetch --no-tags --depth=1 origin "$AGAINST_REF"
+
+    # Inputs and step outputs are passed via env vars rather than interpolated
+    # directly into the script, since ${{ }} expansion happens before the
+    # shell ever runs it — a schema-derived value (e.g. from a fork PR)
+    # containing shell metacharacters would otherwise be executed as code.
+    - name: Run plan
+      id: plan
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        AGAINST_REF: ${{ inputs.against-ref }}
+        SCHEMA_PATH: ${{ inputs.schema-path }}
+      run: |
+        set -uo pipefail
+        # Redirected to a file rather than captured via $(...): a plain
+        # command substitution here hangs waiting for every inherited file
+        # descriptor to close, which one of the go/cue subprocesses never
+        # does on its own.
+        outfile="$(mktemp)"
+        "$ACTION_PATH/scripts/plan-against-commit.sh" "$AGAINST_REF" "$SCHEMA_PATH" > "$outfile" 2>&1
+        plan_status=$?
+        output="$(cat "$outfile")"
+        rm -f "$outfile"
+        echo "$output"
+
+        # Random delimiter: the plan text embeds DDL derived from the
+        # schema being diffed, so a fixed delimiter could be spoofed to
+        # inject extra key=value lines into GITHUB_OUTPUT.
+        delim="cueddl_plan_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+        {
+          echo "plan<<$delim"
+          echo "$output"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$plan_status" -ne 0 ]; then
+          exit "$plan_status"
+        fi
+        if echo "$output" | grep -q "^No changes"; then
+          echo "has-changes=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+        fi
+        if echo "$output" | grep -qE ', [0-9]+ destructive'; then
+          echo "has-destructive=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-destructive=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Write step summary
+      if: always() && steps.plan.outputs.plan != ''
+      shell: bash
+      env:
+        PLAN_TEXT: ${{ steps.plan.outputs.plan }}
+        AGAINST_REF: ${{ inputs.against-ref }}
+      run: |
+        {
+          echo "### cueddl plan (against \`$AGAINST_REF\`)"
+          echo '```'
+          echo "$PLAN_TEXT"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

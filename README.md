@@ -212,6 +212,31 @@ go tool cue export /tmp/old-schema/path/to/schema -e database > /tmp/old.json
 go tool cue export . -e database | go tool cueddl plan --against /tmp/old.json
 ```
 
+commit / ブランチ名を直接指定したいだけなら、上記の worktree 手順を
+`scripts/plan-against-commit.sh <ref> [schema-path]` がまとめて行う:
+
+```sh
+./scripts/plan-against-commit.sh HEAD~1 path/to/schema
+./scripts/plan-against-commit.sh origin/main   # schema-path省略時は "."
+```
+
+### GitHub Actions で PR ごとに差分を見る
+
+このリポジトリ自身が `action.yml`（composite action）を提供している。
+実DB・認証情報は一切不要 (`plan --against` と同様)。
+
+```yaml
+- uses: actions/checkout@<pin> # fetch-depth はマージベースまで届く程度に
+- uses: Kurichi/cueddl@<pin>
+  with:
+    schema-path: path/to/schema
+    against-ref: ${{ github.event.pull_request.base.sha }}
+```
+
+`outputs.plan` / `outputs.has-changes` / `outputs.has-destructive` を返す。
+PR へのコメント投稿など具体的な使い方は呼び出し側のワークフローに委ねている
+(コメント整形や投稿権限の要否はプロジェクトごとに異なるため)。
+
 ## ローカルで試す (emulator)
 
 ```sh

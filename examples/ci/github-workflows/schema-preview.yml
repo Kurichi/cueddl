@@ -1,0 +1,67 @@
+# Stage 1 — cheap, credential-free preview.
+#
+# Runs on every push to a PR that touches the schema. Diffs the PR's schema
+# against the base branch's schema (NOT the live database — no Spanner
+# credentials are needed here at all), and comments the result. This is
+# purely a reviewing aid; it is never the authority for what `apply` will
+# actually do (see schema-plan.yml for that).
+#
+# Copy this file to .github/workflows/schema-preview.yml in your repo and
+# adjust `schema-path` to your schema's location.
+name: Schema preview
+
+on:
+  pull_request:
+    paths:
+      - 'path/to/schema/**' # adjust to your schema location
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # need history back to the PR's merge base
+
+      - name: cueddl plan --against base
+        id: preview
+        uses: Kurichi/cueddl@main # pin to a release once you've chosen one
+        with:
+          schema-path: path/to/schema
+          against-ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Comment preview
+        if: always() && steps.preview.outputs.plan != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          PLAN_TEXT: ${{ steps.preview.outputs.plan }}
+        with:
+          script: |
+            const marker = '<!-- cueddl-schema-preview -->'
+            const body = `${marker}\n### Schema preview (no live database)\n\n\`\`\`\n${process.env.PLAN_TEXT}\n\`\`\``
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const existing = comments.find(c => c.body?.includes(marker))
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              })
+            }

@@ -1,0 +1,104 @@
+# Stage 3 — apply, gated on the live schema still matching the plan that
+# was reviewed in Stage 2.
+#
+# Triggered by a `cueddl apply` comment on the PR, mirroring a
+# plan-before-merge workflow: apply runs against the PR's branch, and only
+# after it succeeds do you merge. Right before applying, this recomputes
+# `cueddl plan` against the live database and compares it against the
+# schema-plan.yml comment — if they differ (most likely because a
+# different PR merged and applied a conflicting change first), apply is
+# refused rather than risk applying on top of a schema nobody reviewed.
+#
+# `author_association` is checked because anyone can comment on a public
+# PR; only comments from users with write access trigger the job.
+#
+# Copy this file to .github/workflows/schema-apply.yml in your repo and
+# adjust `schema-path` and the auth step (this typically wants a more
+# privileged service account than schema-plan.yml's read-only one).
+name: Schema apply
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  apply:
+    if: |
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, 'cueddl apply') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR head ref
+        id: pr
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            })
+            core.setOutput('sha', pr.head.sha)
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.SCHEMA_WIF_PROVIDER }}
+          service_account: ${{ vars.SCHEMA_APPLY_SERVICE_ACCOUNT }}
+
+      - name: Fetch the reviewed plan
+        id: reviewed
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs')
+            const marker = '<!-- cueddl-schema-plan -->'
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const planComment = [...comments].reverse().find(c => c.body?.includes(marker))
+            if (!planComment) {
+              core.setFailed('No schema-plan comment found on this PR yet — run that workflow first.')
+              return
+            }
+            const match = planComment.body.match(/```\n([\s\S]*?)\n```/)
+            if (!match) {
+              core.setFailed('Could not find a fenced code block in the schema-plan comment.')
+              return
+            }
+            fs.writeFileSync('reviewed-plan.txt', match[1] + '\n')
+
+      - name: Verify no drift since the reviewed plan
+        run: |
+          set -euo pipefail
+          go tool cue export path/to/schema -e database | go tool cueddl plan | tee fresh-plan.txt
+          if ! diff -u reviewed-plan.txt fresh-plan.txt; then
+            echo '::error::The live schema has changed since the reviewed plan (diff above). Most likely another PR applied first. Re-run schema-plan.yml and re-review before retrying `cueddl apply`.'
+            exit 1
+          fi
+
+      - name: Apply
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if grep -q -- '--allow-destructive' <<<"$COMMENT_BODY"; then
+            export CUEDDL_ALLOW_DESTRUCTIVE=1
+          fi
+          go tool cue export path/to/schema -e database | go tool cueddl apply

@@ -1,0 +1,90 @@
+# Stage 2 — the authoritative plan, computed against the real live
+# database. This is what schema-apply.yml (Stage 3) re-verifies against
+# immediately before running `cueddl apply`, to catch the case where some
+# other PR merged and applied a conflicting schema change in the meantime.
+#
+# This job authenticates to a real database, so it is intentionally scoped
+# to same-repo PRs: the default `pull_request` trigger already means a
+# forked PR runs with no access to this job's secrets. Do not change this
+# to `pull_request_target` (which would run with this repo's credentials
+# against a fork's arbitrary workflow/schema content) without adding your
+# own authorization checks.
+#
+# Copy this file to .github/workflows/schema-plan.yml in your repo and
+# adjust `schema-path`, the auth step, and the two `vars.*` references.
+name: Schema plan (live database)
+
+on:
+  pull_request:
+    paths:
+      - 'path/to/schema/**' # adjust to your schema location
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write # Workload Identity Federation
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.SCHEMA_WIF_PROVIDER }}
+          service_account: ${{ vars.SCHEMA_PLAN_SERVICE_ACCOUNT }}
+
+      - name: Compute plan against the live database
+        run: |
+          set -euo pipefail
+          go tool cue export path/to/schema -e database | go tool cueddl plan | tee plan.txt
+
+      - name: Comment plan
+        if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const fs = require('fs')
+            const planText = fs.readFileSync('plan.txt', 'utf8')
+            const marker = '<!-- cueddl-schema-plan -->'
+            const body = [
+              marker,
+              '### Schema plan (against the live database)',
+              '',
+              "This is what `cueddl apply` will do. `schema-apply.yml` re-checks this " +
+              'comment against a fresh plan right before applying — if the live schema ' +
+              'changes after this comment (e.g. another PR applied first), apply is refused ' +
+              'until this workflow reruns.',
+              '',
+              '```',
+              planText,
+              '```',
+            ].join('\n')
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const existing = comments.find(c => c.body?.includes(marker))
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              })
+            }

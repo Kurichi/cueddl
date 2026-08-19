@@ -125,6 +125,28 @@ func TestDecodeGeneratedColumn(t *testing.T) {
 	}
 }
 
+func TestDecodeIgnoresCodegenOnlyColumnMarker(t *testing.T) {
+	// schema.#Column.ignored is a hint for downstream code generators only;
+	// the DDL side must treat a marked column exactly like an unmarked one.
+	const withIgnored = `{
+		"project": "p", "instance": "i", "name": "d",
+		"tables": {
+			"Users": {"name": "Users", "columns": {
+				"UserID": {"name": "UserID", "type": "STRING(36)", "notNull": true},
+				"Legacy": {"name": "Legacy", "type": "INT64", "ignored": true}
+			}, "primaryKey": ["UserID"]}
+		}
+	}`
+	db, err := DecodeJSON(strings.NewReader(withIgnored))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := db.Table("Users").Column("Legacy")
+	if legacy == nil || legacy.Type != "INT64" {
+		t.Errorf("ignored-marked column must decode as a normal column, got %+v", legacy)
+	}
+}
+
 func TestValidateRejectsGeneratedWithDefault(t *testing.T) {
 	const both = `{
 		"project": "p", "instance": "i", "name": "d",

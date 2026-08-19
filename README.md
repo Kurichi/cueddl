@@ -87,6 +87,22 @@ database: schema.#Database & {
 UpdatedAt: {type: "TIMESTAMP", allowCommitTimestamp: true}
 ```
 
+列を安全に削除するための `ignored` マーカー:
+
+```cue
+// DDL上は残したまま、コード生成などの下流ツールからだけ隠す。
+// cueddl の plan/apply はこのフラグを無視する (スキーマ差分は出ない)。
+Legacy: {type: "INT64", ignored: true}
+```
+
+列の削除は「先に参照コードを消してデプロイ → その後 DROP」の順でないと
+稼働中の旧コードを壊しうるため、2段階で行います:
+
+1. 列に `ignored: true` を付ける。CUE から生成されるコードからは列が消えるが、
+   DDL は不変なので plan は No changes のまま。これをデプロイして参照を無くす
+2. デプロイ完了後、列の定義ごと削除する。plan に `DROP COLUMN` が出るので
+   通常どおり apply する
+
 TTL (ROW DELETION POLICY) と CHANGE STREAM:
 
 ```cue

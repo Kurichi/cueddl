@@ -41,6 +41,15 @@ package schema
 	if generated != _|_ {
 		default?: _|_
 	}
+	// ignored marks the column as hidden from downstream consumers (code
+	// generators etc.) while keeping it in the database schema: cueddl's
+	// DDL generation treats the column exactly as if the flag were absent.
+	// This enables the expand/contract dance for dropping a column safely:
+	// first set ignored: true so regenerated code stops referencing the
+	// column (the schema itself is unchanged — plan reports no diff), roll
+	// that code out everywhere, then delete the column definition in a
+	// follow-up change and apply the DROP.
+	ignored?: bool
 }
 
 // #KeyPart is one component of a primary key or index key.
